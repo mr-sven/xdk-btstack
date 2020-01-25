@@ -1,0 +1,3 @@
+[submodule "source/btstack"]
+	path = source/btstack
+	url = https://github.com/mr-sven/btstack.git
