@@ -76,6 +76,21 @@ extern void hal_cpu_disable_irqs(void){}
 extern void hal_cpu_enable_irqs(void){}
 extern void hal_cpu_enable_irqs_and_sleep(void){}
 
+static const char BT_VERS_NO[][4] = {
+	"1.0",
+	"1.1",
+	"1.2",
+	"2.0",
+	"2.1",
+	"3.0",
+	"4.0",
+	"4.1",
+	"4.2",
+	"5.0",
+	"5.1",
+	"5.2"
+};
+
 /**
  * @brief  BTstack HAL ms time implementation for wait processes
  */
@@ -106,15 +121,12 @@ static void transport_packet_handler(uint8_t packet_type, uint16_t channel,	uint
 		}
 		break;
 	case HCI_EVENT_COMMAND_COMPLETE:
-		if (HCI_EVENT_IS_COMMAND_COMPLETE(packet,
-				hci_read_local_version_information))
+		if (HCI_EVENT_IS_COMMAND_COMPLETE(packet, hci_read_local_version_information))
 		{
-			uint16_t revision = little_endian_read_16(packet, 5);
-			uint16_t lmprevision = little_endian_read_16(packet, 10);
-			printf("HCI Version: 1.0\r\n");
-			printf("HCI Revision: %d\r\n", revision);
-			printf("LMP Version: %d\r\n", packet[7]);
-			printf("LMP Revision: %d\r\n", lmprevision);
+        	uint16_t revision = little_endian_read_16(packet, 7);
+        	uint16_t lmprevision = little_endian_read_16(packet, 12);
+            printf("HCI Version: %s r%d\r\n", BT_VERS_NO[packet[6]], revision);
+            printf("LMP Version: %s r%d\r\n", BT_VERS_NO[packet[9]], lmprevision);
 		}
 		break;
 	case HCI_EVENT_COMMAND_STATUS:
@@ -132,8 +144,18 @@ static void transport_packet_handler(uint8_t packet_type, uint16_t channel,	uint
 /**< Maximum data to receive = 1 byte packet type, 2 byte command, 1 byte length, max 265 byte data */
 #define MAX_RX_DATA_SIZE		(1 + 2 + 1 + 0xff)
 
-/**< data to read counter for rx buffer */
-static uint16_t rx_data_to_recv = MAX_RX_DATA_SIZE;
+/**< packet reader state machine */
+typedef enum {
+    H4_W4_PACKET_TYPE,
+    H4_W4_ONE_BYTE_LENTGH,
+    H4_W4_TWO_BYTE_LENGTH,
+    H4_W4_TWO_BYTE_LENGTH_2,
+    H4_W4_PAYLOAD,
+} H4_STATE;
+
+static H4_STATE hci_transport_em9301_h4_state;
+static volatile uint16_t hci_transport_em9301_spi_bytes_to_read;
+static uint16_t hci_transport_em9301_spi_low_bytes_to_read;
 
 /**
  * @brief   UART ISR event handler
@@ -146,34 +168,61 @@ static void btstackAdapter_uart_event(UART_T uart, struct MCU_UART_Event_S event
 		// store data to ring buffer
 		RingBuffer_Write(&transport_rx_ring_buffer, mcu_uart_rx_buffer, 1);
 
-		// position of packet Type
-		if (rx_data_to_recv == MAX_RX_DATA_SIZE	&& mcu_uart_rx_buffer[0] == HCI_EVENT_PACKET)
+		hci_transport_em9301_spi_bytes_to_read--;
+
+		// early exit until bytes to read
+		if (hci_transport_em9301_spi_bytes_to_read)
 		{
-			// event packet is one byte shorter because event-type is only one byte long
-			rx_data_to_recv--;
+			return;
 		}
 
-		// count to zero
-		rx_data_to_recv--;
-
-		// position of content length
-		if (rx_data_to_recv == 0xff)
+		switch (hci_transport_em9301_h4_state)
 		{
-			rx_data_to_recv = mcu_uart_rx_buffer[0];
-		}
+		case H4_W4_PACKET_TYPE:
+			switch (mcu_uart_rx_buffer[0])
+			{
+			case HCI_EVENT_PACKET:
+				// wait for second byte is length
+				hci_transport_em9301_spi_bytes_to_read = 2;
+				hci_transport_em9301_h4_state = H4_W4_ONE_BYTE_LENTGH;
+				return;
+			case HCI_ACL_DATA_PACKET:
+				// wait for third byte is length LOW
+				hci_transport_em9301_spi_bytes_to_read = 3;
+				hci_transport_em9301_h4_state = H4_W4_TWO_BYTE_LENGTH;
+				return;
+			}
+			return;
 
-		// all data read
-		if (rx_data_to_recv == 0)
-		{
-			// reset data to read
-			rx_data_to_recv = MAX_RX_DATA_SIZE;
+		case H4_W4_ONE_BYTE_LENTGH:
+			hci_transport_em9301_spi_bytes_to_read = mcu_uart_rx_buffer[0];
+			hci_transport_em9301_h4_state = H4_W4_PAYLOAD;
+			return;
+
+		case H4_W4_TWO_BYTE_LENGTH:
+			hci_transport_em9301_spi_bytes_to_read = 1;
+			hci_transport_em9301_spi_low_bytes_to_read = mcu_uart_rx_buffer[0];
+			hci_transport_em9301_h4_state = H4_W4_TWO_BYTE_LENGTH_2;
+			return;
+
+		case H4_W4_TWO_BYTE_LENGTH_2:
+			hci_transport_em9301_spi_bytes_to_read = hci_transport_em9301_spi_low_bytes_to_read | (mcu_uart_rx_buffer[0] << 8);
+			hci_transport_em9301_h4_state = H4_W4_PAYLOAD;
+			return;
+
+		case H4_W4_PAYLOAD:
+			hci_transport_em9301_h4_state = H4_W4_PACKET_TYPE;
+			hci_transport_em9301_spi_bytes_to_read = 1;
 
 			// increment current available packet counter
 			transport_packets_to_deliver++;
 
 			// inform BTstack loop
 			btstack_run_loop_freertos_trigger_from_isr();
+			return;
 		}
+
+		return;
 	}
 	else if (event.TxComplete)
 	{
@@ -218,37 +267,37 @@ static void transport_deliver_packets(void)
 		// read packet type
 		RingBuffer_Read(&transport_rx_ring_buffer, &hci_receive_packet_type, 1);
 
-		if (hci_receive_packet_type == HCI_COMMAND_DATA_PACKET)
-		{
-			// read command (2 byte) and length (1 byte)
-			RingBuffer_Read(&transport_rx_ring_buffer, hci_receive_buffer, 3);
+        if (HCI_ACL_DATA_PACKET == hci_receive_packet_type)
+        {
+        	// read ALC header
+            RingBuffer_Read(&transport_rx_ring_buffer, hci_receive_buffer, HCI_ACL_HEADER_SIZE);
 
-			// length from index 2
-			hci_receive_packet_len = hci_receive_buffer[2];
+        	// length from index 3 + 4
+            hci_receive_packet_len = little_endian_read_16(hci_receive_buffer, 2);
 
-			// read data to buffer with length
-			RingBuffer_Read(&transport_rx_ring_buffer, &hci_receive_buffer[3], hci_receive_packet_len);
+            // read data to buffer with length
+            RingBuffer_Read(&transport_rx_ring_buffer, &hci_receive_buffer[HCI_ACL_HEADER_SIZE], hci_receive_packet_len);
 
-			// packet length plus command and length field
-			hci_receive_packet_len += 3;
-		}
-		else if (hci_receive_packet_type == HCI_EVENT_PACKET)
-		{
-			// read event (1 byte) and length (1 byte)
-			RingBuffer_Read(&transport_rx_ring_buffer, hci_receive_buffer, 2);
+            // packet length plus command and length field
+            hci_receive_packet_len += HCI_ACL_HEADER_SIZE;
+        }
+        else if (HCI_EVENT_PACKET == hci_receive_packet_type)
+        {
+        	// read event Header
+            RingBuffer_Read(&transport_rx_ring_buffer, hci_receive_buffer, HCI_EVENT_HEADER_SIZE);
 
-			// length from index 1
-			hci_receive_packet_len = hci_receive_buffer[1];
+        	// length from index 1
+            hci_receive_packet_len = hci_receive_buffer[1];
 
-			// read data to buffer with length
-			RingBuffer_Read(&transport_rx_ring_buffer, &hci_receive_buffer[2], hci_receive_packet_len);
+            // read data to buffer with length
+            RingBuffer_Read(&transport_rx_ring_buffer, &hci_receive_buffer[HCI_EVENT_HEADER_SIZE], hci_receive_packet_len);
 
-			// packet length plus event and length field
-			hci_receive_packet_len += 2;
-		}
+            // packet length plus event and length field
+            hci_receive_packet_len += HCI_EVENT_HEADER_SIZE;
+        }
 
-		// handle package
-		btstack_packet_handler(hci_receive_packet_type, hci_receive_buffer, hci_receive_packet_len);
+        // handle package
+        btstack_packet_handler(hci_receive_packet_type, hci_receive_buffer, hci_receive_packet_len);
 	}
 }
 
@@ -284,9 +333,12 @@ static void transport_init(const void *transport_config)
 {
 	BCDS_UNUSED(transport_config);
 
+    // init packet state handler
+	hci_transport_em9301_h4_state = H4_W4_PACKET_TYPE;
+	hci_transport_em9301_spi_bytes_to_read = 1;
+
 	// init RX RingBuffer
-	RingBuffer_Initialize(&transport_rx_ring_buffer, transport_rx_buffer,
-	TRANSPORT_READ_BUFFER_SIZE);
+	RingBuffer_Initialize(&transport_rx_ring_buffer, transport_rx_buffer, TRANSPORT_READ_BUFFER_SIZE);
 
 	// create TX Semaphore Mutex
 	transport_tx_signal = xSemaphoreCreateBinary();
