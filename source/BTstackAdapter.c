@@ -162,24 +162,20 @@ int RingBuffer_BytesAvailable(RingBuffer_T * ringBuffer)
  */
 static void hal_uart_em9301_transfer_rx_data(void)
 {
-    while (1)
-    {
-        if (!hal_uart_dma_rx_len) return;
+	if (!hal_uart_dma_rx_len) return;
 
-        int bytes_available = RingBuffer_BytesAvailable(&transport_rx_ring_buffer);
-        if (!bytes_available) return;
+	int bytes_available = RingBuffer_BytesAvailable(&transport_rx_ring_buffer);
+	if (!bytes_available) return;
 
-        int bytes_to_copy = btstack_min(bytes_available, hal_uart_dma_rx_len);
-        uint32_t bytes_read = RingBuffer_Read(&transport_rx_ring_buffer, hal_uart_dma_rx_buffer, bytes_to_copy);
-        hal_uart_dma_rx_buffer += bytes_read;
-        hal_uart_dma_rx_len    -= bytes_read;
+	int bytes_to_copy = btstack_min(bytes_available, hal_uart_dma_rx_len);
+	uint32_t bytes_read = RingBuffer_Read(&transport_rx_ring_buffer, hal_uart_dma_rx_buffer, bytes_to_copy);
+	hal_uart_dma_rx_buffer += bytes_read;
+	hal_uart_dma_rx_len    -= bytes_read;
 
-        if (hal_uart_dma_rx_len == 0)
-        {
-            (*rx_done_handler)();
-            return;
-        }
-    }
+	if (hal_uart_dma_rx_len == 0)
+	{
+		(*rx_done_handler)();
+	}
 }
 
 /**
@@ -332,6 +328,8 @@ static void btstack_init(void* pvParameters)
 
 	// init HCI
 	hci_init(hci_transport_h4_instance(btstack_uart_block_freertos_instance()), &config);
+
+	hci_dump_open(NULL, HCI_DUMP_STDOUT);
 
 	// load chipset
 	hci_set_chipset(btstack_chipset_em9301_instance());
