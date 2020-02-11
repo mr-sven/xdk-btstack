@@ -42,6 +42,8 @@
 #define MAX_NR_LE_DEVICE_DB_ENTRIES 1
 #define NVM_NUM_DEVICE_DB_ENTRIES 4
 
+#define HAL_UART_DMA_DEINIT
+
 // fixing unused in BTstack
 #ifdef UNUSED
 #undef UNUSED
