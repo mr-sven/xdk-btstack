@@ -35,18 +35,6 @@
 /**< Application controller task stack size */
 #define BTTASK_STACK_SIZE_APP_CONTROLLER              (UINT32_C(1200))
 
-/**< size of the rx ringbuffer */
-#define TRANSPORT_READ_BUFFER_SIZE	0x100
-
-/**< rx ringbuffer */
-RingBuffer_T transport_rx_ring_buffer;
-
-/**< rx buffer for rx ringbuffer */
-static uint8_t transport_rx_buffer[TRANSPORT_READ_BUFFER_SIZE];
-
-/**< transport tx semaphore mutex */
-static SemaphoreHandle_t transport_tx_signal;
-
 /**< EM9301 uart handle */
 static HWHandle_T em9301_uart_handle;
 
@@ -56,26 +44,32 @@ static uint8_t mcu_uart_rx_buffer[1];
 /**< own packet handler callback struct */
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 
-/**< data source for integration with BTstack Runloop */
-static btstack_data_source_t transport_data_source;
-
-/**< packet send signal for BTstack */
-static int transport_signal_sent;
-
-/**< packet received signal for BTstack */
-static volatile int transport_packets_to_deliver = 0;
-
-/**< BTStack callback for packet handling */
-static void (*btstack_packet_handler)(uint8_t packet_type, uint8_t *packet, uint16_t size);
-
 /**< TaskHandle for the BTStack run loop */
 static xTaskHandle btstack_task_handle = NULL;
 
-// BTstack HAL CPU Implementation
+/**< BTstack HAL CPU Implementation */
 extern void hal_cpu_disable_irqs(void){}
 extern void hal_cpu_enable_irqs(void){}
 extern void hal_cpu_enable_irqs_and_sleep(void){}
 
+/**< ISR Handler callbacks */
+static void (*rx_done_handler)(void);
+static void (*tx_done_handler)(void);
+
+/**< rx ringbuffer size */
+#define UART_EM9301_RING_BUFFER_SIZE  256
+
+/**< rx ringbuffer */
+RingBuffer_T transport_rx_ring_buffer;
+
+/**< rx buffer for rx ringbuffer */
+static uint8_t transport_rx_buffer[UART_EM9301_RING_BUFFER_SIZE];
+
+/**< rx buffer pointer and size */
+static uint8_t  * hal_uart_dma_rx_buffer;
+static uint16_t   hal_uart_dma_rx_len;
+
+/**< list of BTLE Versions */
 static const char BT_VERS_NO[][4] = {
 	"1.0",
 	"1.1",
@@ -136,26 +130,57 @@ static void transport_packet_handler(uint8_t packet_type, uint16_t channel,	uint
 			printf("Command status error 0x%02x %04x\r\n", packet[2], opcode);
 		}
 		break;
+	case HCI_EVENT_VENDOR_SPECIFIC:
+		switch (packet[2])
+		{
+		case HCI_SUBEVENT_EM_STANDBY_STATE:
+			printf("Device in Standby State\r\n");
+			break;
+		default:
+			break;
+		}
+		break;
 	default:
+    	log_debug("transport_packet_handler %02x: ", packet_type);
+    	log_debug_hexdump(packet, size);
 		break;
 	}
 }
 
-/**< Maximum data to receive = 1 byte packet type, 2 byte command, 1 byte length, max 265 byte data */
-#define MAX_RX_DATA_SIZE		(1 + 2 + 1 + 0xff)
+/**
+ * @brief   returns the current avilable size of BSP Ring Buffer
+ */
+int RingBuffer_BytesAvailable(RingBuffer_T * ringBuffer)
+{
+    int diff = ringBuffer->WriteIndex - ringBuffer->ReadIndex;
+    if (diff >= 0) return diff;
+    return diff + ringBuffer->Size;
+}
 
-/**< packet reader state machine */
-typedef enum {
-    H4_W4_PACKET_TYPE,
-    H4_W4_ONE_BYTE_LENTGH,
-    H4_W4_TWO_BYTE_LENGTH,
-    H4_W4_TWO_BYTE_LENGTH_2,
-    H4_W4_PAYLOAD,
-} H4_STATE;
+/**
+ * @brief   Executes the data transfer to bt stack
+ */
+static void hal_uart_em9301_transfer_rx_data(void)
+{
+    while (1)
+    {
+        if (!hal_uart_dma_rx_len) return;
 
-static H4_STATE hci_transport_em9301_h4_state;
-static volatile uint16_t hci_transport_em9301_spi_bytes_to_read;
-static uint16_t hci_transport_em9301_spi_low_bytes_to_read;
+        int bytes_available = RingBuffer_BytesAvailable(&transport_rx_ring_buffer);
+        if (!bytes_available) return;
+
+        int bytes_to_copy = btstack_min(bytes_available, hal_uart_dma_rx_len);
+        uint32_t bytes_read = RingBuffer_Read(&transport_rx_ring_buffer, hal_uart_dma_rx_buffer, bytes_to_copy);
+        hal_uart_dma_rx_buffer += bytes_read;
+        hal_uart_dma_rx_len    -= bytes_read;
+
+        if (hal_uart_dma_rx_len == 0)
+        {
+            (*rx_done_handler)();
+            return;
+        }
+    }
+}
 
 /**
  * @brief   UART ISR event handler
@@ -165,194 +190,85 @@ static void btstackAdapter_uart_event(UART_T uart, struct MCU_UART_Event_S event
 	BCDS_UNUSED(uart);
 	if (event.RxComplete)
 	{
-		// store data to ring buffer
 		RingBuffer_Write(&transport_rx_ring_buffer, mcu_uart_rx_buffer, 1);
-
-		hci_transport_em9301_spi_bytes_to_read--;
-
-		// early exit until bytes to read
-		if (hci_transport_em9301_spi_bytes_to_read)
-		{
-			return;
-		}
-
-		switch (hci_transport_em9301_h4_state)
-		{
-		case H4_W4_PACKET_TYPE:
-			switch (mcu_uart_rx_buffer[0])
-			{
-			case HCI_EVENT_PACKET:
-				// wait for second byte is length
-				hci_transport_em9301_spi_bytes_to_read = 2;
-				hci_transport_em9301_h4_state = H4_W4_ONE_BYTE_LENTGH;
-				return;
-			case HCI_ACL_DATA_PACKET:
-				// wait for third byte is length LOW
-				hci_transport_em9301_spi_bytes_to_read = 3;
-				hci_transport_em9301_h4_state = H4_W4_TWO_BYTE_LENGTH;
-				return;
-			}
-			return;
-
-		case H4_W4_ONE_BYTE_LENTGH:
-			hci_transport_em9301_spi_bytes_to_read = mcu_uart_rx_buffer[0];
-			hci_transport_em9301_h4_state = H4_W4_PAYLOAD;
-			return;
-
-		case H4_W4_TWO_BYTE_LENGTH:
-			hci_transport_em9301_spi_bytes_to_read = 1;
-			hci_transport_em9301_spi_low_bytes_to_read = mcu_uart_rx_buffer[0];
-			hci_transport_em9301_h4_state = H4_W4_TWO_BYTE_LENGTH_2;
-			return;
-
-		case H4_W4_TWO_BYTE_LENGTH_2:
-			hci_transport_em9301_spi_bytes_to_read = hci_transport_em9301_spi_low_bytes_to_read | (mcu_uart_rx_buffer[0] << 8);
-			hci_transport_em9301_h4_state = H4_W4_PAYLOAD;
-			return;
-
-		case H4_W4_PAYLOAD:
-			hci_transport_em9301_h4_state = H4_W4_PACKET_TYPE;
-			hci_transport_em9301_spi_bytes_to_read = 1;
-
-			// increment current available packet counter
-			transport_packets_to_deliver++;
-
-			// inform BTstack loop
-			btstack_run_loop_freertos_trigger_from_isr();
-			return;
-		}
-
-		return;
+		// deliver new data
+		hal_uart_em9301_transfer_rx_data();
 	}
 	else if (event.TxComplete)
 	{
-		// inform TX mutex
-		BaseType_t higherPriorityTaskWoken = pdFALSE;
-		if (xSemaphoreGiveFromISR(transport_tx_signal, &higherPriorityTaskWoken) == pdTRUE)
-		{
-			portYIELD_FROM_ISR(higherPriorityTaskWoken);
-		}
+        (*tx_done_handler)();
 	}
 }
 
 /**
- * @brief   notify BTstack that packed was send
+ * @brief   close transport connection
  */
-static void transport_notify_packet_send(void)
+int hal_uart_dma_deinit(void)
 {
-	// notify upper stack that it might be possible to send again
-	uint8_t event[] =
-	{ HCI_EVENT_TRANSPORT_PACKET_SENT, 0 };
-	btstack_packet_handler(HCI_EVENT_PACKET, &event[0], sizeof(event));
-}
-
-/**< receive buffer for packet handler */
-static uint8_t hci_receive_buffer[MAX_RX_DATA_SIZE];
-
-/**< receive buffer packet type */
-static uint8_t hci_receive_packet_type;
-
-/**< receive buffer packet length */
-static uint8_t hci_receive_packet_len;
-
-/**
- * @brief   deliver packets to BTstack
- */
-static void transport_deliver_packets(void)
-{
-	while (transport_packets_to_deliver > 0)
+	// disable device
+	Retcode_T retcode = BSP_BT_EM9301_Disable();
+	if (RETCODE_OK == retcode)
 	{
-		transport_packets_to_deliver--;
-
-		// read packet type
-		RingBuffer_Read(&transport_rx_ring_buffer, &hci_receive_packet_type, 1);
-
-        if (HCI_ACL_DATA_PACKET == hci_receive_packet_type)
-        {
-        	// read ALC header
-            RingBuffer_Read(&transport_rx_ring_buffer, hci_receive_buffer, HCI_ACL_HEADER_SIZE);
-
-        	// length from index 3 + 4
-            hci_receive_packet_len = little_endian_read_16(hci_receive_buffer, 2);
-
-            // read data to buffer with length
-            RingBuffer_Read(&transport_rx_ring_buffer, &hci_receive_buffer[HCI_ACL_HEADER_SIZE], hci_receive_packet_len);
-
-            // packet length plus command and length field
-            hci_receive_packet_len += HCI_ACL_HEADER_SIZE;
-        }
-        else if (HCI_EVENT_PACKET == hci_receive_packet_type)
-        {
-        	// read event Header
-            RingBuffer_Read(&transport_rx_ring_buffer, hci_receive_buffer, HCI_EVENT_HEADER_SIZE);
-
-        	// length from index 1
-            hci_receive_packet_len = hci_receive_buffer[1];
-
-            // read data to buffer with length
-            RingBuffer_Read(&transport_rx_ring_buffer, &hci_receive_buffer[HCI_EVENT_HEADER_SIZE], hci_receive_packet_len);
-
-            // packet length plus event and length field
-            hci_receive_packet_len += HCI_EVENT_HEADER_SIZE;
-        }
-
-        // handle package
-        btstack_packet_handler(hci_receive_packet_type, hci_receive_buffer, hci_receive_packet_len);
+		// deinit uart handle
+		retcode = MCU_UART_Deinitialize(em9301_uart_handle);
 	}
-}
-
-/**
- * @brief   transport process callback
- */
-static void transport_process(btstack_data_source_t *ds, btstack_data_source_callback_type_t callback_type)
-{
-	BCDS_UNUSED(ds);
-	switch (callback_type)
+	if (RETCODE_OK == retcode)
 	{
-	case DATA_SOURCE_CALLBACK_POLL:
-		if (transport_signal_sent)
-		{
-			transport_signal_sent = 0;
-			transport_notify_packet_send();
-		}
-		if (transport_packets_to_deliver)
-		{
-			transport_deliver_packets();
-		}
-		break;
-	default:
-		break;
+		// disconnect device
+		retcode = BSP_BT_EM9301_Disconnect();
 	}
+
+	return 0;
 }
 
 /**
- * @brief   init transport
- * @param transport_config
+ * @brief   recevies a block of data
  */
-static void transport_init(const void *transport_config)
+void hal_uart_dma_receive_block(uint8_t *buffer, uint16_t length)
 {
-	BCDS_UNUSED(transport_config);
-
-    // init packet state handler
-	hci_transport_em9301_h4_state = H4_W4_PACKET_TYPE;
-	hci_transport_em9301_spi_bytes_to_read = 1;
-
-	// init RX RingBuffer
-	RingBuffer_Initialize(&transport_rx_ring_buffer, transport_rx_buffer, TRANSPORT_READ_BUFFER_SIZE);
-
-	// create TX Semaphore Mutex
-	transport_tx_signal = xSemaphoreCreateBinary();
-
-	// set up polling data_source
-	btstack_run_loop_set_data_source_handler(&transport_data_source, &transport_process);
-	btstack_run_loop_enable_data_source_callbacks(&transport_data_source, DATA_SOURCE_CALLBACK_POLL);
-	btstack_run_loop_add_data_source(&transport_data_source);
+    hal_uart_dma_rx_buffer = buffer;
+    hal_uart_dma_rx_len    = length;
+    hal_uart_em9301_transfer_rx_data();
 }
 
 /**
- * @brief   open transport connection
+ * @brief   sends a block of data
  */
-static int transport_open(void)
+void hal_uart_dma_send_block(const uint8_t *buffer, uint16_t length)
+{
+	// send packet
+	MCU_UART_Send(em9301_uart_handle, (uint8_t *) buffer, length);
+}
+
+/**
+ * @brief   sets the received ISR
+ */
+void hal_uart_dma_set_block_received( void (*the_block_handler)(void))
+{
+    rx_done_handler = the_block_handler;
+}
+
+/**
+ * @brief   sets the sent ISR
+ */
+void hal_uart_dma_set_block_sent( void (*the_block_handler)(void))
+{
+    tx_done_handler = the_block_handler;
+}
+
+/**
+ * @brief   sets baud rate
+ */
+int hal_uart_dma_set_baud(uint32_t baud)
+{
+	BCDS_UNUSED(baud);
+    return 0;
+}
+
+/**
+ * @brief   Initializes UART.
+ */
+void hal_uart_dma_init(void)
 {
 	// connect to EM9301
 	Retcode_T retcode = BSP_BT_EM9301_Connect();
@@ -388,91 +304,17 @@ static int transport_open(void)
 	}
 	if (RETCODE_OK != retcode)
 	{
-		printf("transport_open failed %u\r\n", retcode);
-		return -1;
+		printf("hal_uart_dma_init failed %u\r\n", retcode);
 	}
-
-	return 0;
 }
 
-/**
- * @brief   close transport connection
- */
-static int transport_close(void)
-{
-	// disable device
-	Retcode_T retcode = BSP_BT_EM9301_Disable();
-	if (RETCODE_OK == retcode)
-	{
-		// deinit uart handle
-		retcode = MCU_UART_Deinitialize(em9301_uart_handle);
-	}
-	if (RETCODE_OK == retcode)
-	{
-		// disconnect device
-		retcode = BSP_BT_EM9301_Disconnect();
-	}
-
-	return 0;
-}
-
-/**
- * @brief   packets can always be send due Semaphore mutex lock
- */
-static int transport_can_send_packet_now(uint8_t packet_type)
-{
-	BCDS_UNUSED(packet_type);
-	return 1;
-}
-
-/**
- * @brief   send packet to chipset
- */
-static int transport_send_packet(uint8_t packet_type, uint8_t *packet, int size)
-{
-	// store packet type before actual data and increase size
-	size++;
-	packet--;
-	*packet = packet_type;
-
-	// send packet
-	xSemaphoreTake(transport_tx_signal, 0);
-	Retcode_T retcode = MCU_UART_Send(em9301_uart_handle, packet, size);
-	if (RETCODE_OK == retcode)
-	{
-		if (pdTRUE != xSemaphoreTake(transport_tx_signal, (TickType_t ) 1000))
-		{
-			retcode = RETCODE(RETCODE_SEVERITY_ERROR, RETCODE_TIMEOUT);
-		}
-	}
-	if (RETCODE_OK == retcode)
-	{
-		transport_signal_sent = 1;
-		btstack_run_loop_freertos_trigger();
-	}
-	return 0;
-}
-
-/**
- * @brief   register packet handler for HCI packets: ACL, SCO, and Events
- */
-static void transport_register_packet_handler(void (*handler)(uint8_t packet_type, uint8_t *packet, uint16_t size))
-{
-	btstack_packet_handler = handler;
-}
-
-/**< BTstack transport callbacks */
-static const hci_transport_t transport = {
-		"xdk-vhci",
-		&transport_init,
-		&transport_open,
-		&transport_close,
-		&transport_register_packet_handler,
-		&transport_can_send_packet_now,
-		&transport_send_packet,
-		NULL, // set baud rate
-		NULL, // reset link
-		NULL, // set SCO config
+// dummy config
+static const hci_transport_config_uart_t config = {
+    HCI_TRANSPORT_CONFIG_UART,
+    115200,
+    0,
+    0,
+    NULL
 };
 
 /**
@@ -489,7 +331,7 @@ static void btstack_init(void* pvParameters)
 	btstack_run_loop_init(btstack_run_loop_freertos_get_instance());
 
 	// init HCI
-	hci_init(&transport, NULL);
+	hci_init(hci_transport_h4_instance(btstack_uart_block_freertos_instance()), &config);
 
 	// load chipset
 	hci_set_chipset(btstack_chipset_em9301_instance());
@@ -497,6 +339,9 @@ static void btstack_init(void* pvParameters)
 	// inform about BTstack state
 	hci_event_callback_registration.callback = &transport_packet_handler;
 	hci_add_event_handler(&hci_event_callback_registration);
+
+    // init RX RingBuffer
+	RingBuffer_Initialize(&transport_rx_ring_buffer, transport_rx_buffer, UART_EM9301_RING_BUFFER_SIZE);
 
 	// execut run loop
 	btstack_run_loop_execute();
@@ -518,6 +363,9 @@ Retcode_T BTstackAdapter_Init(void)
 	{
 		return RETCODE(RETCODE_SEVERITY_ERROR, RETCODE_OUT_OF_RESOURCES);
 	}
+
+	// wait for the task to start
+	vTaskDelay(1000);
 
 	return RETCODE_OK;
 }
