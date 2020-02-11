@@ -158,27 +158,6 @@ int RingBuffer_BytesAvailable(RingBuffer_T * ringBuffer)
 }
 
 /**
- * @brief   Executes the data transfer to bt stack
- */
-static void hal_uart_em9301_transfer_rx_data(void)
-{
-	if (!hal_uart_dma_rx_len) return;
-
-	int bytes_available = RingBuffer_BytesAvailable(&transport_rx_ring_buffer);
-	if (!bytes_available) return;
-
-	int bytes_to_copy = btstack_min(bytes_available, hal_uart_dma_rx_len);
-	uint32_t bytes_read = RingBuffer_Read(&transport_rx_ring_buffer, hal_uart_dma_rx_buffer, bytes_to_copy);
-	hal_uart_dma_rx_buffer += bytes_read;
-	hal_uart_dma_rx_len    -= bytes_read;
-
-	if (hal_uart_dma_rx_len == 0)
-	{
-		(*rx_done_handler)();
-	}
-}
-
-/**
  * @brief   UART ISR event handler
  */
 static void btstackAdapter_uart_event(UART_T uart, struct MCU_UART_Event_S event)
@@ -186,9 +165,23 @@ static void btstackAdapter_uart_event(UART_T uart, struct MCU_UART_Event_S event
 	BCDS_UNUSED(uart);
 	if (event.RxComplete)
 	{
-		RingBuffer_Write(&transport_rx_ring_buffer, mcu_uart_rx_buffer, 1);
-		// deliver new data
-		hal_uart_em9301_transfer_rx_data();
+		// Stack needs data, push direct
+		if (hal_uart_dma_rx_len > 0)
+		{
+			*hal_uart_dma_rx_buffer = mcu_uart_rx_buffer[0];
+			hal_uart_dma_rx_buffer++;
+			hal_uart_dma_rx_len--;
+
+			// deliver new data
+			if (hal_uart_dma_rx_len == 0)
+			{
+				(*rx_done_handler)();
+			}
+		}
+		else // no data requested, cache data
+		{
+			RingBuffer_Write(&transport_rx_ring_buffer, mcu_uart_rx_buffer, 1);
+		}
 	}
 	else if (event.TxComplete)
 	{
@@ -224,7 +217,20 @@ void hal_uart_dma_receive_block(uint8_t *buffer, uint16_t length)
 {
     hal_uart_dma_rx_buffer = buffer;
     hal_uart_dma_rx_len    = length;
-    hal_uart_em9301_transfer_rx_data();
+
+    // load data from cache
+    int bytes_available = RingBuffer_BytesAvailable(&transport_rx_ring_buffer);
+	if (!bytes_available) return;
+
+    int bytes_to_copy = btstack_min(bytes_available, hal_uart_dma_rx_len);
+    uint32_t bytes_read = RingBuffer_Read(&transport_rx_ring_buffer, hal_uart_dma_rx_buffer, bytes_to_copy);
+    hal_uart_dma_rx_buffer += bytes_read;
+    hal_uart_dma_rx_len    -= bytes_read;
+
+    if (hal_uart_dma_rx_len == 0)
+    {
+    	(*rx_done_handler)();
+    }
 }
 
 /**
