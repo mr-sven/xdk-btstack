@@ -221,11 +221,11 @@ void hal_uart_dma_receive_block(uint8_t *buffer, uint16_t length)
     // load data from cache
     int bytes_available = RingBuffer_BytesAvailable(&transport_rx_ring_buffer);
 	if (!bytes_available) return;
+	int bytes_to_copy = btstack_min(bytes_available, hal_uart_dma_rx_len);
+	hal_uart_dma_rx_len -= bytes_to_copy;
 
-    int bytes_to_copy = btstack_min(bytes_available, hal_uart_dma_rx_len);
-    uint32_t bytes_read = RingBuffer_Read(&transport_rx_ring_buffer, hal_uart_dma_rx_buffer, bytes_to_copy);
-    hal_uart_dma_rx_buffer += bytes_read;
-    hal_uart_dma_rx_len    -= bytes_read;
+	uint32_t bytes_read = RingBuffer_Read(&transport_rx_ring_buffer, hal_uart_dma_rx_buffer, bytes_to_copy);
+	hal_uart_dma_rx_buffer += bytes_read;
 
     if (hal_uart_dma_rx_len == 0)
     {
